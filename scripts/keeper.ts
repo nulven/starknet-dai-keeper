@@ -1,13 +1,11 @@
 import axios from "axios";
-import { utils } from "ethers";
-import { StarknetContract } from "@shardlabs/starknet-hardhat-plugin/dist/types";
-import { ec, hash } from "starknet";
-import { assert } from "ts-essentials";
-const { genKeyPair, getKeyPair, getStarkKey, sign, verify } = ec;
-const { hashMessage } = hash;
-import type { KeyPair, Signature } from "starknet";
-import { task } from "hardhat/config";
 import * as dotenv from "dotenv";
+import fs from "fs";
+import * as starknet from "starknet";
+import { ethers, utils } from "ethers";
+import { assert } from "ts-essentials";
+const { genKeyPair, getKeyPair, getStarkKey, sign, verify } = starknet.ec;
+import type { KeyPair, Signature } from "starknet";
 dotenv.config();
 
 const MASK_250 = BigInt(2 ** 250 - 1);
@@ -21,89 +19,10 @@ export function toBytes32(a: string): string {
   return `0x${BigInt(a).toString(16).padStart(64, "0")}`;
 }
 
-export class L2Signer {
-  caller: StarknetContract;
-  privateKey;
-  keyPair: KeyPair;
-  publicKey;
-
-  constructor(caller: StarknetContract, privateKey: string) {
-    this.caller = caller;
-    this.privateKey = privateKey;
-    this.keyPair = getKeyPair(this.privateKey);
-    this.publicKey = getStarkKey(this.keyPair);
-  }
-
-  sign(msgHash: string): Signature {
-    return sign(this.keyPair, msgHash);
-  }
-
-  verify(msgHash: string, sig: Signature): boolean {
-    return verify(this.keyPair, msgHash, sig);
-  }
-
-  async sendTransaction(
-    contract: StarknetContract,
-    selectorName: string,
-    calldata: any[] | any,
-    nonce: number = 0
-  ) {
-    if (nonce === 0) {
-      const executionInfo = await this.caller.call("get_nonce");
-      nonce = executionInfo.res;
-    }
-
-    const selector = getSelectorFromName(selectorName);
-    const contractAddress = BigInt(contract.address).toString();
-    const _calldata = flatten(calldata);
-    const msgHash = hashMessage(
-      this.caller.address,
-      contract.address,
-      selector,
-      _calldata,
-      nonce.toString()
-    );
-
-    const sig = this.sign(msgHash);
-    // const verified = this.verify(msgHash, sig);
-
-    return this.caller.invoke(
-      "__execute__",
-      {
-        call_array: [
-          {
-            to: contractAddress,
-            selector,
-            data_offset: 0,
-            data_len: _calldata.length,
-          },
-        ],
-        calldata: _calldata,
-        nonce,
-      },
-      {
-        signature: [sig.r, sig.s],
-      }
-    );
-  }
-}
-
 export function getSelectorFromName(name: string) {
   return (
     BigInt(utils.keccak256(Buffer.from(name))) % MASK_250
   ).toString();
-}
-
-function flatten(calldata: any): any[] {
-  const res: any = [];
-  Object.values(calldata).forEach((data: any) => {
-    if (typeof data === "object") {
-      res.push(...data);
-    } else {
-      res.push(data);
-    }
-  });
-  return res;
 }
 
 export function getRequiredEnv(key: string): string {
@@ -113,16 +32,22 @@ export function getRequiredEnv(key: string): string {
   return value;
 }
 
-export async function getL1ContractAt(hre: any, name: string, address: string) {
+export async function getL1ContractAt(name: string, address: string) {
   console.log(`Using existing contract: ${name} at: ${address}`);
-  const contractFactory = await hre.ethers.getContractFactory(name);
-  return contractFactory.attach(address);
+  const compiledContract = JSON.parse(
+    fs.readFileSync(`./abis/${name}.json`).toString("ascii")
+  );
+  const contractFactory = new ethers.ContractFactory(compiledContract.abi, compiledContract.bytecode);
+  return   contractFactory.attach(address);
 }
 
-export async function getL2ContractAt(hre: any, name: string, address: string) {
+export async function getL2ContractAt(provider: any, name: string, address: string) {
   console.log(`Using existing contract: ${name} at: ${address}`);
-  const contractFactory = await hre.starknet.getContractFactory(name);
-  return contractFactory.getContractAt(address);
+  const compiledContract = JSON.parse(
+    fs.readFileSync(`./abis/${name}.json`).toString("ascii")
+  );
+  const contractFactory = new starknet.ContractFactory(compiledContract, provider);
+  return contractFactory.attach(address);
 }
 
 async function transaction(
@@ -149,44 +74,46 @@ async function transaction(
   }
 }
 
-task("flush", "")
-  .setAction(async ({}, hre) => {
-    const NETWORK = hre.network.name.toUpperCase();
+async function flush() {
+    const NETWORK = getRequiredEnv("NETWORK").toUpperCase();
+    const provider = new starknet.Provider({
+        baseUrl: 'https://alpha4.starknet.io',
+        feederGatewayUrl: 'feeder_gateway',
+        gatewayUrl: 'gateway',
+    })
     const l1WormholeGatewayAddress = getRequiredEnv(`${NETWORK}_L1_DAI_WORMHOLE_GATEWAY_ADDRESS`);
     const l2WormholeGatewayAddress = getRequiredEnv(`${NETWORK}_L2_DAI_WORMHOLE_GATEWAY_ADDRESS`);
-    const l1WormholeGateway = await getL1ContractAt(hre, "L1DAIWormholeGateway", l1WormholeGatewayAddress);
-    const l2WormholeGateway = await getL2ContractAt(hre, "l2_dai_wormhole_gateway", l2WormholeGatewayAddress);
+    const l1WormholeGateway = await getL1ContractAt("L1DAIWormholeGateway", l1WormholeGatewayAddress);
+    const l2WormholeGateway = await getL2ContractAt(provider, "l2_dai_wormhole_gateway", l2WormholeGatewayAddress);
 
     const accountAddress = getRequiredEnv(`${NETWORK}_L2_ACCOUNT_ADDRESS`);
-    const account = await getL2ContractAt(hre, "account", accountAddress);
 
     const ECDSA_PRIVATE_KEY =
       process.env[`${NETWORK}_ECDSA_PRIVATE_KEY`];
     if (!ECDSA_PRIVATE_KEY) {
       throw new Error(`Set ${NETWORK}_ECDSA_PRIVATE_KEY in .env`);
     }
-    const l2Signer = new L2Signer(account, ECDSA_PRIVATE_KEY);
+    const starkKeyPair = starknet.ec.genKeyPair(ECDSA_PRIVATE_KEY);
+    const starkKeyPub = starknet.ec.getStarkKey(starkKeyPair);;
+    const account = new starknet.Account(provider, accountAddress, starkKeyPair);
 
     const domain = getRequiredEnv("DOMAIN");
-    const { res: daiToFlushSplit } = await l2WormholeGateway.call("batched_dai_to_flush", { domain });
+    const { res: daiToFlushSplit } = await l2WormholeGateway.batched_dai_to_flush(domain);
     const daiToFlush = toUint(daiToFlushSplit);
     console.log(`DAI to flush: ${daiToFlush}`);
 
     if (daiToFlush > 0 || true) {
       console.log("Sending `flush` transaction");
-      const tx = await l2Signer.sendTransaction(
-        l2WormholeGateway,
-        "flush",
-        [domain],
-      );
+      let { code, transaction_hash: txHash } = await l2WormholeGateway.flush(domain);
 
-      let state = "PENDING";
-      console.log(`Waiting for transaction ${tx} to be accepted on L1`);
-      while (state !== "ACCEPTED_ON_L1") {
-        state = (await transaction(tx, NETWORK)).status;
+      console.log(`Waiting for transaction ${txHash} to be accepted on L1`);
+      while (code !== "ACCEPTED_ON_L1") {
+        code = (await transaction(txHash, NETWORK)).status;
       }
 
       console.log("Sending `finalizeFlush` transaction");
       await l1WormholeGateway.finalizeFlush(toBytes32(domain), daiToFlush);
     }
-});
+}
+
+flush();
