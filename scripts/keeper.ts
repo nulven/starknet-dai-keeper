@@ -8,6 +8,8 @@ import * as dotenv from "dotenv";
 dotenv.config();
 
 const NETWORK = getRequiredEnv("NETWORK").toUpperCase();
+const ENV = getRequiredEnv("NODE_ENV").toUpperCase();
+
 const SOURCE_DOMAIN = `${NETWORK}-SLAVE-STARKNET-1`;
 const FLUSH_DELAY = 100;
 
@@ -52,12 +54,12 @@ export async function getL2ContractAt(signer: any, name: string, address: string
 function getL1Signer(network: string) {
   let baseUrl;
   const infuraApiKey = getRequiredEnv("INFURA_API_KEY");
-  if (network === "MAINNET") {
+  if (network === "LOCALHOST" || ENV === "DEV") {
+    baseUrl = "http://localhost:8545";
+  } else if (network === "MAINNET") {
     baseUrl =  `https://mainnet.infura.io/v3/${infuraApiKey}`;
   } else if (network === "GOERLI") {
     baseUrl =  `https://goerli.infura.io/v3/${infuraApiKey}`;
-  } else if (network === "LOCALHOST") {
-    baseUrl = "http://localhost:8545";
   }
   const provider = ethers.getDefaultProvider(baseUrl);
   const mnemonic = getRequiredEnv("MNEMONIC");
@@ -66,12 +68,12 @@ function getL1Signer(network: string) {
 
 function getL2Signer(network: string) {
   let baseUrl;
-  if (network === "MAINNET") {
+  if (network === "LOCALHOST" || ENV === "DEV") {
+    baseUrl = "http://localhost:5000";
+  } else if (network === "MAINNET") {
     baseUrl = "https://alpha-mainnet.starknet.io";
   } else if (network === "GOERLI") {
     baseUrl = "https://alpha4.starknet.io";
-  } else if (network === "LOCALHOST") {
-    baseUrl = "http://localhost:5000";
   }
   const provider = new starknet.Provider({
       baseUrl,
@@ -80,12 +82,52 @@ function getL2Signer(network: string) {
   });
   const address = getRequiredEnv(`${network}_L2_ACCOUNT_ADDRESS`);
   const l2PrivateKey = getRequiredEnv(`${network}_L2_PRIVATE_KEY`);
-  const starkKeyPair = starknet.ec.genKeyPair(l2PrivateKey);
-  const starkKeyPub = starknet.ec.getStarkKey(starkKeyPair);;
+  const starkKeyPair = starknet.ec.getKeyPair(l2PrivateKey);
+  const starkKeyPub = starknet.ec.getStarkKey(starkKeyPair);
   const compiledArgentAccount = JSON.parse(
     fs.readFileSync("./abis/ArgentAccount.json").toString("ascii")
   );
   return new starknet.Account(provider, address, starkKeyPair);
+}
+
+async function deployAccount(network: string) {
+  let baseUrl;
+  if (network === "LOCALHOST" || ENV === "DEV") {
+    baseUrl = "http://localhost:5000";
+  } else if (network === "MAINNET") {
+    baseUrl = "https://alpha-mainnet.starknet.io";
+  } else if (network === "GOERLI") {
+    baseUrl = "https://alpha4.starknet.io";
+  }
+  const provider = new starknet.Provider({
+      baseUrl,
+      feederGatewayUrl: 'feeder_gateway',
+      gatewayUrl: 'gateway',
+  });
+  const l2PrivateKey = getRequiredEnv(`GOERLI_L2_PRIVATE_KEY`);
+  const starkKeyPair = starknet.ec.getKeyPair(l2PrivateKey);
+  const starkKeyPub = starknet.ec.getStarkKey(starkKeyPair);;
+  const compiledArgentAccount = JSON.parse(
+    fs.readFileSync("./abis/ArgentAccount.json").toString("ascii")
+  );
+  const accountResponse = await provider.deployContract({
+    contract: compiledArgentAccount,
+    constructorCalldata: [],
+    addressSalt: starkKeyPub,
+  });
+  await provider.waitForTransaction(accountResponse.transaction_hash);
+  const accountContract = new starknet.Contract(
+    compiledArgentAccount.abi,
+    accountResponse.address,
+    provider
+  );
+  const { transaction_hash: initializeTxHash } = await accountContract.initialize(
+    starkKeyPub,
+    "0"
+  );
+  await provider.waitForTransaction(initializeTxHash);
+  const account = new starknet.Account(provider, accountContract.address, starkKeyPair);
+  console.log(account.address, account.privateKey);
 }
 
 async function flush(targetDomain: string) {
@@ -98,10 +140,6 @@ async function flush(targetDomain: string) {
   const l2WormholeGatewayAddress = getRequiredEnv(`${NETWORK}_L2_DAI_WORMHOLE_GATEWAY_ADDRESS`);
   const l2WormholeGateway = await getL2ContractAt(l2Signer, "l2_dai_wormhole_gateway", l2WormholeGatewayAddress);
 
-  const starknetInterface = new ethers.utils.Interface([
-    "event LogMessageToL1(uint256 indexed fromAddress, address indexed toAddress, uint256[] payload)",
-    "event ConsumedMessageToL1(uint256 indexed fromAddress, address indexed toAddress,uint256[] payload)",
-  ]);
   const wormholeJoinInterface = new ethers.utils.Interface([
     "event Settle(bytes32 indexed sourceDomain, uint256 batchedDaiToFlush)",
   ]);
@@ -118,7 +156,7 @@ async function flush(targetDomain: string) {
 
   // check last settle event and amount to flush
   const currentBlock = await l1Signer.provider.getBlockNumber();
-  if (daiToFlush > 0 && recentEvent.blockNumber > currentBlock + FLUSH_DELAY) {
+  if (daiToFlush > 0 && (!recentEvent || recentEvent.blockNumber > currentBlock + FLUSH_DELAY)) {
     console.log("Sending `flush` transaction");
     await l2WormholeGateway.flush(encodedDomain, { maxFee: "0" });
   }
@@ -140,7 +178,7 @@ async function finalizeFlush(targetDomain: string) {
   ]);
   const starknet = new ethers.Contract(starknetAddress, starknetInterface, l1Signer);
   const logMessageFilter = starknet.filters.LogMessageToL1(l2WormholeGatewayAddress, l1WormholeGatewayAddress);
-  const logMessageEvents = await starknet.queryFilter(logMessageFilter,	6830000);
+  const logMessageEvents = await starknet.queryFilter(logMessageFilter, 6800000);
   const recentLogMessageEvent = logMessageEvents[logMessageEvents.length-1];
   if (recentLogMessageEvent) {
     const consumedMessageFilter = starknet.filters.ConsumedMessageToL1(l2WormholeGatewayAddress, l1WormholeGatewayAddress, recentLogMessageEvent.args.payload);
