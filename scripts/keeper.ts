@@ -7,21 +7,21 @@ const { genKeyPair, getStarkKey } = starknet.ec;
 import * as dotenv from "dotenv";
 dotenv.config();
 
-const MASK_250 = BigInt(2 ** 250 - 1);
+const NETWORK = getRequiredEnv("NETWORK").toUpperCase();
+const SOURCE_DOMAIN = `${NETWORK}-SLAVE-STARKNET-1`;
+const FLUSH_DELAY = 100;
 
 function toUint(splitUint: object): bigint {
   const _a = Object.values(splitUint);
   return BigInt(`0x${_a[1].toString(16)}${_a[0].toString(16)}`);
 }
 
-export function toBytes32(a: string): string {
-  return `0x${BigInt(a).toString(16).padStart(64, "0")}`;
+function l1String(str: string): string {
+  return ethers.utils.formatBytes32String(str);
 }
 
-export function getSelectorFromName(name: string) {
-  return (
-    BigInt(utils.keccak256(Buffer.from(name))) % MASK_250
-  ).toString();
+function l2String(str: string): string {
+  return `0x${Buffer.from(str, "utf8").toString("hex").padStart(64, "0")}`;
 }
 
 export function getRequiredEnv(key: string): string {
@@ -78,8 +78,8 @@ function getL2Signer(network: string) {
       feederGatewayUrl: 'feeder_gateway',
       gatewayUrl: 'gateway',
   });
-  const address = getRequiredEnv("L2_ADDRESS");
-  const l2PrivateKey = getRequiredEnv("L2_PRIVATE_KEY");
+  const address = getRequiredEnv(`${network}_L2_ACCOUNT_ADDRESS`);
+  const l2PrivateKey = getRequiredEnv(`${network}_L2_PRIVATE_KEY`);
   const starkKeyPair = starknet.ec.genKeyPair(l2PrivateKey);
   const starkKeyPub = starknet.ec.getStarkKey(starkKeyPair);;
   const compiledArgentAccount = JSON.parse(
@@ -88,41 +88,77 @@ function getL2Signer(network: string) {
   return new starknet.Account(provider, address, starkKeyPair);
 }
 
-async function flush() {
-    const NETWORK = getRequiredEnv("NETWORK").toUpperCase();
+async function flush(targetDomain: string) {
+  const l1Signer = getL1Signer(NETWORK);
+  const l2Signer = getL2Signer(NETWORK);
 
-    const l1Signer = getL1Signer(NETWORK);
-    const l2Signer = getL2Signer(NETWORK);
+  const l1WormholeGatewayAddress = getRequiredEnv(`${NETWORK}_L1_DAI_WORMHOLE_GATEWAY_ADDRESS`);
+  const l1WormholeGateway = await getL1ContractAt(l1Signer, "L1DAIWormholeGateway", l1WormholeGatewayAddress);
 
-    const l1WormholeGatewayAddress = getRequiredEnv(`${NETWORK}_L1_DAI_WORMHOLE_GATEWAY_ADDRESS`);
-    const l2WormholeGatewayAddress = getRequiredEnv(`${NETWORK}_L2_DAI_WORMHOLE_GATEWAY_ADDRESS`);
-    const l1WormholeGateway = await getL1ContractAt(l1Signer, "L1DAIWormholeGateway", l1WormholeGatewayAddress);
-    const l2WormholeGateway = await getL2ContractAt(l2Signer, "l2_dai_wormhole_gateway", l2WormholeGatewayAddress);
+  const l2WormholeGatewayAddress = getRequiredEnv(`${NETWORK}_L2_DAI_WORMHOLE_GATEWAY_ADDRESS`);
+  const l2WormholeGateway = await getL2ContractAt(l2Signer, "l2_dai_wormhole_gateway", l2WormholeGatewayAddress);
 
-    const domain = getRequiredEnv("DOMAIN");
-    const encodedDomain = `0x0${ethers.utils.formatBytes32String(domain).slice(2, 65)}`;
-    const { res: daiToFlushSplit } = await l2WormholeGateway.batched_dai_to_flush(encodedDomain);
-    const daiToFlush = toUint(daiToFlushSplit);
-    console.log(`DAI to flush: ${daiToFlush}`);
+  const starknetInterface = new ethers.utils.Interface([
+    "event LogMessageToL1(uint256 indexed fromAddress, address indexed toAddress, uint256[] payload)",
+    "event ConsumedMessageToL1(uint256 indexed fromAddress, address indexed toAddress,uint256[] payload)",
+  ]);
+  const wormholeJoinInterface = new ethers.utils.Interface([
+    "event Settle(bytes32 indexed sourceDomain, uint256 batchedDaiToFlush)",
+  ]);
+  const l1WormholeJoinAddress = getRequiredEnv(`${NETWORK}_L1_WORMHOLE_JOIN_ADDRESS`);
+  const l1WormholeJoin = new ethers.Contract(l1WormholeJoinAddress, wormholeJoinInterface, l1Signer);
+  const filter = l1WormholeJoin.filters.Settle(l1String(SOURCE_DOMAIN));
+  const events = await l1WormholeJoin.queryFilter(filter);
+  const recentEvent = events[events.length - 1];
 
-    if (daiToFlush > 0) {
-      console.log("Sending `flush` transaction");
-      let { code, transaction_hash: txHash } = await l2WormholeGateway.flush(encodedDomain, { maxFee: "0" });
+  const encodedDomain = l2String(targetDomain);
+  const { res: daiToFlushSplit } = await l2WormholeGateway.batched_dai_to_flush(encodedDomain);
+  const daiToFlush = toUint(daiToFlushSplit);
+  console.log(`DAI to flush: ${daiToFlush}`);
 
-      console.log(`Waiting for transaction ${txHash} to be accepted on L1`);
-      while (code !== "ACCEPTED_ON_L1") {
-        const res = await l2Signer.getTransactionStatus(txHash);
-        code = res.tx_status;
-        if (code === "REJECTED") {
-          throw Error(`Tx failed: ${res.tx_failure_reason.error_message}`);
-        }
-        console.log(`Transaction status: ${code}`);
-        await delay(1000);
-      }
+  // check last settle event and amount to flush
+  const currentBlock = await l1Signer.provider.getBlockNumber();
+  if (daiToFlush > 0 && recentEvent.blockNumber > currentBlock + FLUSH_DELAY) {
+    console.log("Sending `flush` transaction");
+    await l2WormholeGateway.flush(encodedDomain, { maxFee: "0" });
+  }
+}
+
+async function finalizeFlush(targetDomain: string) {
+  const l1Signer = getL1Signer(NETWORK);
+  const l2Signer = getL2Signer(NETWORK);
+
+  const l1WormholeGatewayAddress = getRequiredEnv(`${NETWORK}_L1_DAI_WORMHOLE_GATEWAY_ADDRESS`);
+  const l2WormholeGatewayAddress = getRequiredEnv(`${NETWORK}_L2_DAI_WORMHOLE_GATEWAY_ADDRESS`);
+  const starknetAddress = getRequiredEnv(`${NETWORK}_STARKNET_ADDRESS`);
+  const l1WormholeGateway = await getL1ContractAt(l1Signer, "L1DAIWormholeGateway", l1WormholeGatewayAddress);
+  const l2WormholeGateway = await getL2ContractAt(l2Signer, "l2_dai_wormhole_gateway", l2WormholeGatewayAddress);
+
+  const starknetInterface = new ethers.utils.Interface([
+    "event LogMessageToL1(uint256 indexed fromAddress, address indexed toAddress, uint256[] payload)",
+    "event ConsumedMessageToL1(uint256 indexed fromAddress, address indexed toAddress,uint256[] payload)",
+  ]);
+  const starknet = new ethers.Contract(starknetAddress, starknetInterface, l1Signer);
+  const logMessageFilter = starknet.filters.LogMessageToL1(l2WormholeGatewayAddress, l1WormholeGatewayAddress);
+  const logMessageEvents = await starknet.queryFilter(logMessageFilter,	6830000);
+  const recentLogMessageEvent = logMessageEvents[logMessageEvents.length-1];
+  if (recentLogMessageEvent) {
+    const consumedMessageFilter = starknet.filters.ConsumedMessageToL1(l2WormholeGatewayAddress, l1WormholeGatewayAddress, recentLogMessageEvent.args.payload);
+    const consumedMessageEvents = await starknet.queryFilter(consumedMessageFilter, recentLogMessageEvent.blockNumber);
+    if (consumedMessageEvents.length < 0) {
+      const encodedDomain = l2String(targetDomain);
+      const { res: daiToFlushSplit } = await l2WormholeGateway.batched_dai_to_flush(encodedDomain);
+      const daiToFlush = toUint(daiToFlushSplit);
 
       console.log("Sending `finalizeFlush` transaction");
       await l1WormholeGateway.finalizeFlush(encodedDomain, daiToFlush);
     }
+  }
+  console.log("No pending flush");
 }
 
-flush();
+if (process.argv[2] === "flush") {
+  flush(process.argv[3]);
+} else if (process.argv[2] === "finalizeFlush") {
+  finalizeFlush(process.argv[3]);
+}
